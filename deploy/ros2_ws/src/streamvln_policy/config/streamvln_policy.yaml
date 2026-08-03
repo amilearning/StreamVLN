@@ -30,6 +30,20 @@ streamvln_policy_node:
     step_m: 0.25          # metres per FORWARD token   (model-trained value)
     turn_deg: 15.0        # degrees per TURN token     (model-trained value)
 
+    # --- receding horizon ------------------------------------------------------------
+    # The model returns 4 tokens; execute_tokens is how many are actually played before
+    # re-planning from a fresh frame (0 = all 4). chunk_seconds is the budget for the
+    # tokens EXECUTED, so the per-token duration stretches to fill it:
+    #     execute_tokens=4, chunk_seconds=1.0 -> 0.25 s/token -> 1.00 m/s, 60 deg/s
+    #     execute_tokens=2, chunk_seconds=1.0 -> 0.50 s/token -> 0.50 m/s, 30 deg/s
+    # Executing a prefix costs nothing in speed and keeps the request cadence matched to
+    # the server's ~0.9 s response time. What it buys is replanning every 0.5 m instead
+    # of every 1.0 m, which is what bounds how stale the frame behind each decision is.
+    execute_tokens: 2
+    # Tokens past the horizon are discarded -- except a STOP. Dropping one means driving
+    # on when the model thought the task was over; stopping a token early is cheaper.
+    honor_stop_beyond_horizon: true
+
     # speed_mode:
     #   geometric  derive speeds from chunk_seconds so each token covers the trained
     #              increment; v_max/w_max are a SAFETY CLAMP and a bound clamp is warned

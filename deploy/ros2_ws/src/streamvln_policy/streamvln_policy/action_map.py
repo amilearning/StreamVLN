@@ -85,20 +85,36 @@ def plan_chunk(actions: Sequence[int],
                turn_deg: float = 15.0,
                v_max: float = 1.0,
                w_max: float = 1.2,
-               mode: str = "geometric") -> ChunkPlan:
+               mode: str = "geometric",
+               execute_tokens: int = 0,
+               honor_stop_beyond_horizon: bool = True) -> ChunkPlan:
     """Turn one action chunk into timed velocity segments.
 
-    The per-token duration is `chunk_seconds / TOKENS_PER_CHUNK` regardless of how many
-    tokens actually arrived, so a short or truncated chunk keeps the same cadence rather
-    than stretching to fill the budget.
+    RECEDING HORIZON. The model returns TOKENS_PER_CHUNK tokens, but `execute_tokens`
+    (0 = all) controls how many are actually played before re-planning from a fresh
+    frame. Executing a prefix costs nothing in speed -- `chunk_seconds` is the budget for
+    the tokens ACTUALLY EXECUTED, so the per-token duration stretches to fill it and the
+    request cadence stays matched to the server's response time. What it buys is more
+    replanning per metre travelled, which is the thing that limits how stale the frame
+    behind each decision can be.
+
+    Tokens past the horizon are discarded -- EXCEPT a STOP. Dropping a STOP means driving
+    on when the model believed the task was over, so by default a STOP anywhere in the
+    returned chunk still ends the plan after the executed prefix. Stopping up to a token
+    early is the cheaper error.
     """
+    n_exec = TOKENS_PER_CHUNK if execute_tokens <= 0 else min(int(execute_tokens),
+                                                              TOKENS_PER_CHUNK)
     v_cmd, w_cmd, clamped = chunk_speeds(
-        chunk_seconds, step_m, turn_deg, v_max, w_max, TOKENS_PER_CHUNK, mode)
-    per_token = chunk_seconds / float(TOKENS_PER_CHUNK)
+        chunk_seconds, step_m, turn_deg, v_max, w_max, n_exec, mode)
+    per_token = chunk_seconds / float(n_exec)
+
+    horizon = list(actions)[:n_exec]
+    stop_beyond = honor_stop_beyond_horizon and STOP in [int(a) for a in list(actions)[n_exec:]]
 
     segments: List[Segment] = []
-    stop = False
-    for a in actions:
+    stop = stop_beyond
+    for a in horizon:
         a = int(a)
         if a == STOP:
             stop = True
@@ -123,11 +139,14 @@ def format_actions(actions: Sequence[int]) -> str:
 
 
 if __name__ == "__main__":                          # quick self-check
-    for cs in (1.0, 2.0):
-        v, w, c = chunk_speeds(cs)
-        print(f"chunk={cs}s -> v={v:.3f} m/s, w={math.degrees(w):.1f} deg/s, clamped={c}")
-    p = plan_chunk([3, 3, 1, 0], chunk_seconds=1.0)
-    print("plan [3,3,1,0]:", format_actions([3, 3, 1, 0]),
-          f"stop={p.stop} segments={len(p.segments)} total={sum(s.duration for s in p.segments):.2f}s")
-    for s in p.segments:
-        print(f"   token={s.token} vx={s.vx:.2f} wz={s.wz:+.2f} dur={s.duration:.2f}")
+    for cs, n in ((1.0, 4), (1.0, 2), (2.0, 4)):
+        v, w, c = chunk_speeds(cs, tokens=n)
+        print(f"chunk={cs}s over {n} tokens ({cs / n:.2f}s each) -> "
+              f"v={v:.3f} m/s, w={math.degrees(w):.1f} deg/s, clamped={c}")
+
+    print("\nreceding horizon, execute_tokens=2:")
+    for acts in ([3, 3, 1, 1], [1, 1, 0, 0], [1, 1, 1, 0]):
+        p = plan_chunk(acts, chunk_seconds=1.0, execute_tokens=2)
+        played = "".join(format_actions([s.token]) for s in p.segments)
+        print(f"  {format_actions(acts)} -> plays {played or '(none)'} "
+              f"total={sum(s.duration for s in p.segments):.2f}s stop={p.stop}")

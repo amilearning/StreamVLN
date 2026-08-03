@@ -1,5 +1,6 @@
 import argparse
 import numpy as np
+import io
 import json
 import threading
 import time
@@ -10,7 +11,7 @@ import os
 import transformers
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 from streamvln.streamvln_agent import VLNEvaluator
@@ -27,6 +28,9 @@ output_dir = ''
 # The instruction used when a request does not carry one (keeps the stock go2 client,
 # which posts only {"reset": bool}, working unchanged).
 DEFAULT_INSTRUCTION = "Walk forward and immediately stop when you exit the room."
+# Newest annotated frame (JPEG bytes) + last inference summary, for the /debug view.
+latest_annotated = None
+last_info = {}
 # Held for the lifetime of a session: StreamVLN only re-reads the instruction when it
 # rebuilds the prompt (every memory reset), so it must outlive the request that set it.
 instruction = DEFAULT_INSTRUCTION
@@ -66,6 +70,13 @@ def annotate_image(idx, image, start_time, total_generate_time, llm_output, outp
         y_position += text_height
 
     image.save(f'{output_dir}/rgb_{idx}_annotated.png')
+
+    # Keep the newest annotated frame in memory too, so /debug can serve a live view
+    # without anyone having to shell into the box and open PNGs.
+    global latest_annotated
+    buf = io.BytesIO()
+    image.save(buf, format='jpeg', quality=85)
+    latest_annotated = buf.getvalue()
 
 # The evaluator holds ONE global KV-cache session. Two clients interleaving requests
 # silently corrupts it -- SDPA then dies with "Expected key.size(1) == value.size(1)" and
@@ -167,11 +178,55 @@ def _eval_vln_impl():
         print("!!!!!!!!!!!!!!!!!task finish!!!!!!!!!!!!!!!!!!!!!")
         return jsonify({'action': [0]})
     
+    last_info.update({'frame': idx, 'action': list(action_seq), 'glyphs': str_action,
+                      'instruction': instruction, 'generate_time': total_generate_time,
+                      'elapsed': time.time() - start_time})
+
     # 'action' keeps the stock contract; the extra fields let a client verify which
     # instruction the session is actually running under and track inference latency.
     return jsonify({'action': action_seq,
                     'instruction': instruction,
                     'generate_time': total_generate_time})
+
+
+@app.route("/debug")
+def debug_view():
+    """Live view of what the model is actually seeing and deciding.
+
+    Auto-refreshing page showing the newest annotated frame plus the last inference
+    summary. Handy for watching a run from a laptop instead of tailing container logs.
+    """
+    return f"""<!doctype html><meta charset="utf-8"><title>StreamVLN debug</title>
+<meta http-equiv="refresh" content="1">
+<style>
+ body{{background:#111;color:#eee;font:14px/1.5 monospace;margin:0;padding:16px}}
+ img{{max-width:100%;border:1px solid #333;image-rendering:pixelated}}
+ table{{border-collapse:collapse;margin-top:12px}} td{{padding:2px 14px 2px 0}}
+ .k{{color:#888}} .none{{color:#c66}}
+</style>
+<h2 style="margin:0 0 12px">StreamVLN &mdash; live debug</h2>
+{'<img src="/debug/frame.jpg?t=' + str(time.time()) + '">'
+ if latest_annotated else '<p class="none">no frame yet &mdash; waiting for the first request</p>'}
+<table>
+{''.join(f'<tr><td class="k">{k}</td><td>{v}</td></tr>' for k, v in last_info.items())}
+<tr><td class="k">terminated</td><td>{terminate}</td></tr>
+<tr><td class="k">output_dir</td><td>{output_dir}</td></tr>
+</table>"""
+
+
+@app.route("/debug/frame.jpg")
+def debug_frame():
+    if latest_annotated is None:
+        return Response(status=404)
+    return Response(latest_annotated, mimetype='image/jpeg')
+
+
+@app.route("/status")
+def status():
+    """Machine-readable sibling of /debug, for scripts and the ROS node."""
+    return jsonify({'ready': True, 'terminated': terminate,
+                    'instruction': instruction, 'busy': _session_lock.locked(),
+                    **last_info})
     
 if __name__ == '__main__':
     global local_rank

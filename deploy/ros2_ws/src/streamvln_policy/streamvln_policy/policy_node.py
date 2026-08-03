@@ -106,6 +106,8 @@ class StreamVlnPolicyNode(Node):
         self._v_max = float(p["v_max"])
         self._w_max = float(p["w_max"])
         self._speed_mode = str(p["speed_mode"])
+        self._execute_tokens = int(p["execute_tokens"])
+        self._honor_stop_beyond = bool(p["honor_stop_beyond_horizon"])
         self._gap_hold_s = float(p["gap_hold_s"])
         self._request_lead_s = float(p["request_lead_s"])
         self._control_hz = float(p["control_hz"])
@@ -149,11 +151,13 @@ class StreamVlnPolicyNode(Node):
 
         # Refuse to start on a geometry the robot cannot deliver: in 'geometric' mode a
         # bound cap means silent under-travel, which corrupts the model's spatial prior.
-        v_need = self._step_m / (self._chunk_seconds / TOKENS_PER_CHUNK)
-        w_need = math.radians(self._turn_deg) / (self._chunk_seconds / TOKENS_PER_CHUNK)
+        n_exec = (TOKENS_PER_CHUNK if self._execute_tokens <= 0
+                  else min(self._execute_tokens, TOKENS_PER_CHUNK))
+        v_need = self._step_m / (self._chunk_seconds / n_exec)
+        w_need = math.radians(self._turn_deg) / (self._chunk_seconds / n_exec)
         self.get_logger().info(
-            f"chunk={self._chunk_seconds:.2f}s over {TOKENS_PER_CHUNK} tokens "
-            f"({self._chunk_seconds / TOKENS_PER_CHUNK:.3f}s/token) requires "
+            f"chunk={self._chunk_seconds:.2f}s over {n_exec}/{TOKENS_PER_CHUNK} tokens "
+            f"({self._chunk_seconds / n_exec:.3f}s/token) requires "
             f"v={v_need:.2f} m/s, w={math.degrees(w_need):.1f} deg/s "
             f"[caps v_max={self._v_max:.2f}, w_max={math.degrees(self._w_max):.1f} deg/s, "
             f"mode={self._speed_mode}]")
@@ -211,6 +215,10 @@ class StreamVlnPolicyNode(Node):
             "v_max": 1.0,
             "w_max": 1.2,
             "speed_mode": "geometric",
+            # Receding horizon: play only the first N of the 4 returned tokens, then
+            # re-plan from a fresh frame. 0 = play all 4.
+            "execute_tokens": 2,
+            "honor_stop_beyond_horizon": True,
             "gap_hold_s": 0.25,
             "request_lead_s": 0.90,
             "control_hz": 20.0,
@@ -389,7 +397,8 @@ class StreamVlnPolicyNode(Node):
                 continue                                   # prompt changed mid-flight
 
             plan = plan_chunk(actions, self._chunk_seconds, self._step_m, self._turn_deg,
-                              self._v_max, self._w_max, self._speed_mode)
+                              self._v_max, self._w_max, self._speed_mode,
+                              self._execute_tokens, self._honor_stop_beyond)
             if plan.clamped and not self._warn_clamped_once:
                 self._warn_clamped_once = True
                 self.get_logger().warn(

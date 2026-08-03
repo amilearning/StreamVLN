@@ -25,14 +25,26 @@ prompt). Zeros are published continuously in every state except while executing.
 StreamVLN returns **4 discrete tokens** per request:
 `1`=forward 0.25 m, `2`=left 15°, `3`=right 15°, `0`=stop.
 
-`chunk_seconds` is the wall-clock budget for all 4, so each token gets `chunk_seconds/4`.
-In the default `geometric` mode the speeds are *derived* so each token still covers the
-increment the model was trained on:
+`execute_tokens` (default **2**) is a **receding horizon**: only the first N tokens are
+played, then the node re-plans from a fresh frame. `chunk_seconds` is the budget for the
+tokens *actually executed*, so in the default `geometric` mode speeds are derived to make
+each token cover the increment the model was trained on:
 
-| `chunk_seconds` | per token | forward | turn |
-|---|---|---|---|
-| **1.0** (default) | 0.25 s | **1.00 m/s** | **60 °/s** |
-| 2.0 | 0.50 s | 0.50 m/s | 30 °/s |
+| `execute_tokens` | `chunk_seconds` | per token | forward | turn | replan every |
+|---|---|---|---|---|---|
+| **2** (default) | **1.0** | 0.50 s | **0.50 m/s** | **30 °/s** | **0.5 m** |
+| 4 | 1.0 | 0.25 s | 1.00 m/s | 60 °/s | 1.0 m |
+| 4 | 2.0 | 0.50 s | 0.50 m/s | 30 °/s | 1.0 m |
+
+Note rows 1 and 3: same speed, but the receding horizon replans **twice as often per
+metre**. Executing a prefix costs nothing in speed — it keeps the request cadence matched
+to the server's ~0.9 s response time while halving how far the robot travels on any one
+decision. That distance is what bounds how stale the frame behind each decision can be.
+
+Tokens past the horizon are discarded, **except a STOP**: dropping one means driving on
+when the model thought the task was over, so by default a STOP anywhere in the returned
+chunk still ends the plan (`honor_stop_beyond_horizon`). Stopping a token early is the
+cheaper error.
 
 `v_max`/`w_max` are a safety clamp, not a tuning knob. **If a clamp binds, the robot
 under-travels relative to what StreamVLN believes it did** — and the model's memory

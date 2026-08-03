@@ -24,6 +24,7 @@ _OVERRIDES = {
     "prompt_topic": str,
     "cmd_vel_topic": str,
     "chunk_seconds": float,
+    "execute_tokens": int,
     "joy_gate_enable": lambda s: s.strip().lower() in ("1", "true", "yes", "on"),
     "joy_button": int,
 }
