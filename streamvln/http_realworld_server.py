@@ -1,8 +1,10 @@
 import argparse
 import numpy as np
 import json
+import threading
 import time
 import torch
+import traceback
 import sys
 import os
 import transformers
@@ -21,6 +23,13 @@ terminate = False
 total_generate_time = 0.0
 start_time = time.time()
 output_dir = ''
+
+# The instruction used when a request does not carry one (keeps the stock go2 client,
+# which posts only {"reset": bool}, working unchanged).
+DEFAULT_INSTRUCTION = "Walk forward and immediately stop when you exit the room."
+# Held for the lifetime of a session: StreamVLN only re-reads the instruction when it
+# rebuilds the prompt (every memory reset), so it must outlive the request that set it.
+instruction = DEFAULT_INSTRUCTION
 def annotate_image(idx, image, start_time, total_generate_time, llm_output, output_dir):
     image = Image.fromarray(image)#.save(f'rgb_{idx}.png')
     draw = ImageDraw.Draw(image)
@@ -58,9 +67,35 @@ def annotate_image(idx, image, start_time, total_generate_time, llm_output, outp
 
     image.save(f'{output_dir}/rgb_{idx}_annotated.png')
 
-@app.route("/eval_vln",methods=['POST'])
+# The evaluator holds ONE global KV-cache session. Two clients interleaving requests
+# silently corrupts it -- SDPA then dies with "Expected key.size(1) == value.size(1)" and
+# every later request fails until the process is restarted. Serialize access, and if
+# inference does throw, drop the cache so the next request starts clean instead of
+# inheriting the wreckage.
+_session_lock = threading.Lock()
+SESSION_LOCK_TIMEOUT_S = 60.0
+
+
+@app.route("/eval_vln", methods=['POST'])
 def eval_vln():
-    global action_seq, idx, terminate, total_generate_time, output_dir, start_time
+    if not _session_lock.acquire(timeout=SESSION_LOCK_TIMEOUT_S):
+        return jsonify({'error': 'busy: another client holds the session'}), 429
+    try:
+        return _eval_vln_impl()
+    except Exception as exc:
+        traceback.print_exc()
+        try:
+            evaluator.reset_memory()
+        except Exception:
+            print("session reset FAILED after error; restart the server")
+        return jsonify({'error': f'{type(exc).__name__}: {exc}',
+                        'session_reset': True}), 503
+    finally:
+        _session_lock.release()
+
+
+def _eval_vln_impl():
+    global action_seq, idx, terminate, total_generate_time, output_dir, start_time, instruction
 
     image_file = request.files['image']
     json_data = request.form['json']
@@ -71,10 +106,16 @@ def eval_vln():
     image = np.asarray(image)[...,::-1]
 
     camera_pose = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    instruction = "Walk forward and immediately stop when you exit the room."
 
-    
-    policy_init = data['reset']
+    # Instruction comes from the request when present, otherwise the session keeps the
+    # last one it was given. A reset with no instruction falls back to the default.
+    req_instruction = (data.get('instruction') or '').strip()
+    policy_init = bool(data.get('reset', False))
+    if req_instruction:
+        instruction = req_instruction
+    elif policy_init:
+        instruction = DEFAULT_INSTRUCTION
+
     if policy_init:
         start_time = time.time()
         total_generate_time = 0.0
@@ -82,7 +123,7 @@ def eval_vln():
         idx = 0
         output_dir = 'runs' + datetime.now().strftime('%m-%d-%H%M')
         os.makedirs(output_dir, exist_ok=True)
-        print("init reset model!!!")
+        print(f"init reset model!!! instruction: {instruction!r}")
         evaluator.reset_memory()
     
     idx += 1
@@ -126,7 +167,11 @@ def eval_vln():
         print("!!!!!!!!!!!!!!!!!task finish!!!!!!!!!!!!!!!!!!!!!")
         return jsonify({'action': [0]})
     
-    return jsonify({'action': action_seq})
+    # 'action' keeps the stock contract; the extra fields let a client verify which
+    # instruction the session is actually running under and track inference latency.
+    return jsonify({'action': action_seq,
+                    'instruction': instruction,
+                    'generate_time': total_generate_time})
     
 if __name__ == '__main__':
     global local_rank
