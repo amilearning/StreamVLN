@@ -1,0 +1,74 @@
+streamvln_policy_node:
+  ros__parameters:
+
+    # --- StreamVLN inference server -------------------------------------------------
+    # Runs anywhere with a GPU; see deploy/docker/. 127.0.0.1 = same box as this node.
+    host: "127.0.0.1"
+    port: 5801
+    request_timeout_s: 30.0
+
+    # --- I/O topics -----------------------------------------------------------------
+    image_topic: "/boom/boom/color/image_raw"   # sensor_msgs/Image (rgb8/bgr8/mono8)
+    prompt_topic: "/prompt"                     # std_msgs/String, the instruction
+    cmd_vel_topic: "/genvideo/cmd_vel"          # geometry_msgs/TwistStamped -> mux -> base
+    status_topic: "/streamvln/status"           # std_msgs/String, JSON diagnostics
+    cmd_frame_id: "base_link"
+    camera_qos_sensor_data: true                # BEST_EFFORT to match camera publishers
+    status_hz: 2.0
+
+    # --- motion shaping --------------------------------------------------------------
+    # StreamVLN returns 4 discrete tokens per request. chunk_seconds is the wall-clock
+    # budget for playing all 4, so each token gets chunk_seconds/4.
+    #
+    # At chunk_seconds=1.0 that is 0.25 s/token, which to preserve the increments the
+    # model was TRAINED on (0.25 m forward, 15 deg turn) requires:
+    #     forward  0.25 m / 0.25 s = 1.00 m/s
+    #     turn     15 deg  / 0.25 s = 60 deg/s  (1.047 rad/s)
+    # That is brisk indoors. Raising chunk_seconds to 2.0 halves both and keeps the
+    # geometry exact -- prefer that over lowering v_max, which breaks the geometry.
+    chunk_seconds: 1.0
+    step_m: 0.25          # metres per FORWARD token   (model-trained value)
+    turn_deg: 15.0        # degrees per TURN token     (model-trained value)
+
+    # speed_mode:
+    #   geometric  derive speeds from chunk_seconds so each token covers the trained
+    #              increment; v_max/w_max are a SAFETY CLAMP and a bound clamp is warned
+    #              about loudly, because it means silent under-travel.
+    #   capped     obey the caps first and accept the shortfall.
+    speed_mode: "geometric"
+    v_max: 1.0            # m/s   hard clamp
+    w_max: 1.2            # rad/s hard clamp
+
+    # --- request pipelining ----------------------------------------------------------
+    # Measured on Jetson Thor (sdpa, bf16): ~0.77 s median, ~1.2 s worst case. Firing the
+    # next request once the buffered plan drops below request_lead_s overlaps inference
+    # with execution, so motion stays continuous. request_lead_s must be >= the server's
+    # response time, or the plan drains before the next chunk lands and the robot stutters:
+    # at lead=0.35 with 0.77s inference the measured duty cycle was only 77%. gap_hold_s holds the last velocity when
+    # a response is late, instead of showing a visible stutter.
+    request_lead_s: 0.90
+    gap_hold_s: 0.25
+    control_hz: 20.0
+
+    # --- joystick deadman gate -------------------------------------------------------
+    # Actions only play while the button is held. VERIFY joy_button against your pad
+    # before trusting it: an index that is never pressed silently disables all motion,
+    # and the wrong index is worse.
+    joy_gate_enable: true
+    joy_topic: "/joy"
+    joy_button: 3
+
+    # --- behaviour -------------------------------------------------------------------
+    # The server flips channel order (`[..., ::-1]`) because the stock Go2 client hands it
+    # a bgr8 array through PIL. Keep this TRUE so the model receives true RGB; turning it
+    # off silently feeds channel-swapped images -- no error, just worse navigation.
+    bgr_swap: true
+    jpeg_quality: 90
+    reset_on_prompt_change: true   # new prompt clears the plan + resets the server session
+    # The server holds ONE KV-cache session. If it gets corrupted (e.g. two clients ever
+    # talk to it at once) every request fails until it is reset, so force a reset after
+    # this many consecutive failures rather than retrying into a dead session forever.
+    reset_after_errors: 3
+    default_prompt: ""             # only used when autostart is true
+    autostart: false               # true = start on default_prompt without waiting for /prompt
+    verbose: true

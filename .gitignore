@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+# http_realworld_server.py writes annotated frames into its CWD
+streamvln/runs*/
+
+# colcon build artefacts
+deploy/ros2_ws/build/
+deploy/ros2_ws/install/
+deploy/ros2_ws/log/

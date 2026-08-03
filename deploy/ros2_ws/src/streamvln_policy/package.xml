@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://relaxng.org/ns/structure/1.0"?>
+<package format="3">
+  <name>streamvln_policy</name>
+  <version>0.1.0</version>
+  <description>
+    ROS 2 policy requester for StreamVLN: turns an onboard RGB stream plus a
+    natural-language instruction into base velocity commands by querying a StreamVLN
+    inference server over HTTP. Holds no model and needs no GPU.
+  </description>
+  <maintainer email="hojin.projects@gmail.com">amilearning</maintainer>
+  <license>CC-BY-NC-SA-4.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-requests</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
