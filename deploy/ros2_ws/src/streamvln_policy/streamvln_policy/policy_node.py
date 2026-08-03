@@ -120,8 +120,10 @@ class StreamVlnPolicyNode(Node):
         # --- joy gate ---
         self._joy_gate_enable = bool(p["joy_gate_enable"])
         self._joy_button = int(p["joy_button"])
+        self._joy_topic = str(p["joy_topic"])
         self._joy_go = False
         self._joy_seen = False
+        self._no_joy_ticks = 0
 
         # --- shared state (guarded by _lock) ---
         self._lock = threading.Lock()
@@ -204,7 +206,7 @@ class StreamVlnPolicyNode(Node):
             "prompt_topic": "/prompt",
             "cmd_vel_topic": "/genvideo/cmd_vel",
             "status_topic": "/streamvln/status",
-            "joy_topic": "/joy",
+            "joy_topic": "/joy_teleop/joy",
             "cmd_frame_id": "base_link",
             "camera_qos_sensor_data": True,
             "status_hz": 2.0,
@@ -453,6 +455,18 @@ class StreamVlnPolicyNode(Node):
         msg = String()
         msg.data = json.dumps(status)
         self._status_pub.publish(msg)
+
+        # A gate topic nobody publishes to looks exactly like "robot won't move" with no
+        # error anywhere. Say so out loud rather than sitting there silently stopped.
+        if self._joy_gate_enable and not self._joy_seen and status["state"] == RUNNING:
+            self._no_joy_ticks += 1
+            if self._no_joy_ticks % 10 == 1:        # ~every 5 s at status_hz=2
+                self.get_logger().warn(
+                    f"no Joy messages on '{self._joy_topic}' -- the deadman gate can never "
+                    f"open, so nothing will move. Check the topic name and that the "
+                    f"joystick node is running (ros2 topic hz {self._joy_topic}).")
+        else:
+            self._no_joy_ticks = 0
 
     # ------------------------------------------------------------------ shutdown
     def destroy_node(self) -> bool:

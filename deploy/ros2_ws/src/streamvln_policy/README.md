@@ -80,6 +80,16 @@ the time that chunk's last token executes. This is inherent, and the reason not 
 - **One client only.** The server's KV-cache is global; two clients corrupt it and every
   later request fails. After `reset_after_errors` consecutive failures the node forces a
   reset rather than retrying into a dead session.
+- **A misconfigured gate looks identical to a broken robot.** Wrong `joy_topic` or
+  `joy_button` means the gate never opens and nothing moves, with no error. Find yours by
+  holding the button and watching `ros2 topic echo <joy_topic> --field buttons`. The node
+  warns every ~5 s if it is `RUNNING` but has received no `Joy` message at all.
+  On this Husky: `/joy_teleop/joy`, 15 buttons, deadman = index **3**. (`/joy` also
+  exists on the graph but has no publisher; and Clearpath's `enable_button: 4` belongs to
+  `teleop_twist_joy`'s stick driving, not to this gate.)
+- **There may be a second gate downstream.** Here `cmd_vel_relay` subscribes to
+  `/genvideo/cmd_vel` *and* `/joy_teleop/joy` and applies its own deadman before
+  republishing to `/cmd_vel` — so the node's gate is defence in depth, not the only one.
 
 ## Configuration
 

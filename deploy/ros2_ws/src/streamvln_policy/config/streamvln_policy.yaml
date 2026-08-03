@@ -65,11 +65,19 @@ streamvln_policy_node:
     control_hz: 20.0
 
     # --- joystick deadman gate -------------------------------------------------------
-    # Actions only play while the button is held. VERIFY joy_button against your pad
-    # before trusting it: an index that is never pressed silently disables all motion,
-    # and the wrong index is worse.
+    # Actions only play while the button is held. VERIFY both of these against your own
+    # pad before trusting them: a topic with no publisher, or an index that is never
+    # pressed, silently disables ALL motion -- and a wrong index is worse than that.
+    # To check, hold the button and watch which index goes to 1:
+    #     ros2 topic echo <joy_topic> --field buttons
+    #
+    # Measured on this Husky: /joy_teleop/joy, 15 buttons, deadman = index 3.
+    # NOTE /joy also exists on the graph but has NO publisher -- pointing at it means
+    # the gate never opens. Note also that Clearpath's teleop_joy.yaml declares
+    # `enable_button: 4`; that is teleop_twist_joy's stick-driving enable, a DIFFERENT
+    # subsystem, and not the button used here.
     joy_gate_enable: true
-    joy_topic: "/joy"
+    joy_topic: "/joy_teleop/joy"
     joy_button: 3
 
     # --- behaviour -------------------------------------------------------------------
