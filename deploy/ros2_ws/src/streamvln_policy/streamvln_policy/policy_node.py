@@ -115,6 +115,10 @@ class StreamVlnPolicyNode(Node):
         self._bgr_swap = bool(p["bgr_swap"])
         self._jpeg_quality = int(p["jpeg_quality"])
         self._reset_on_prompt_change = bool(p["reset_on_prompt_change"])
+        self._stop_behavior = str(p["stop_behavior"]).strip().lower()
+        if self._stop_behavior not in ("latch", "continue"):
+            raise ValueError(f"stop_behavior must be 'latch' or 'continue', got {self._stop_behavior!r}")
+        self._stops = 0
         self._verbose = bool(p["verbose"])
 
         # --- joy gate ---
@@ -137,6 +141,10 @@ class StreamVlnPolicyNode(Node):
         self._pending_reset = True
         self._prompt: str = str(p["default_prompt"])
         self._have_prompt = bool(self._prompt) and bool(p["autostart"])
+        # autostart must also leave IDLE, or the inference loop never fires and the node
+        # sits silently doing nothing with a prompt it never uses.
+        if self._have_prompt:
+            self._state = RUNNING
         self._frame: Optional[np.ndarray] = None
         self._frame_stamp = 0.0
         self._last_actions: List[int] = []
@@ -232,6 +240,10 @@ class StreamVlnPolicyNode(Node):
             "jpeg_quality": 90,
             "reset_on_prompt_change": True,
             "reset_after_errors": 3,
+            # What to do when the model emits STOP:
+            #   latch     halt and wait for a new prompt (default; the model said done)
+            #   continue  reset the session and keep navigating
+            "stop_behavior": "latch",
             "default_prompt": "",
             "autostart": False,
             "verbose": True,
@@ -333,9 +345,19 @@ class StreamVlnPolicyNode(Node):
                     # does not show up as a visible stutter, then fall back to zero.
                     self._starved_t += dt
                     if self._stop_after_plan:
-                        self._state = DONE
+                        self._stop_after_plan = False
                         self._clear_plan_locked()
-                        self.get_logger().info("STOP token reached -> DONE (awaiting new prompt)")
+                        if self._stop_behavior == "continue":
+                            # Keep going. The server latches its own `terminate` flag on a
+                            # STOP and then short-circuits every later request without
+                            # running the model, so only a reset clears it.
+                            self._pending_reset = True
+                            self._stops += 1
+                            self.get_logger().info(
+                                f"STOP token #{self._stops} -> continuing (session reset)")
+                        else:
+                            self._state = DONE
+                            self.get_logger().info("STOP token reached -> DONE (awaiting new prompt)")
                     elif self._last_seg is not None and self._starved_t <= self._gap_hold_s:
                         vx, wz = self._last_seg.vx, self._last_seg.wz
 
@@ -356,8 +378,16 @@ class StreamVlnPolicyNode(Node):
                 prompt = self._prompt
                 reset = self._pending_reset
                 remaining = self._remaining_locked()
+                stop_pending = self._stop_after_plan
 
             if state != RUNNING or not have_prompt or frame is None:
+                self._shutdown.wait(0.05)
+                continue
+            if stop_pending and not reset:
+                # A STOP is already committed for the tail of the current plan. Anything
+                # requested now is discarded when the plan drains, and against a server
+                # that has latched `terminate` it is a stream of 0.01 s no-ops. Wait for
+                # the plan to finish so the reset can go out instead.
                 self._shutdown.wait(0.05)
                 continue
             if remaining > self._request_lead_s:
@@ -386,10 +416,14 @@ class StreamVlnPolicyNode(Node):
                 continue
 
             with self._lock:
-                self._pending_reset = False
-                self._consec_errors = 0
+                # Clear ONLY the reset this request actually carried. Clearing
+                # unconditionally loses a reset raised by the control tick while the
+                # request was in flight -- which is exactly what happens on a STOP, and
+                # it leaves the server's `terminate` latch set forever.
                 if reset:
+                    self._pending_reset = False
                     self._resets += 1
+                self._consec_errors = 0
                 self._requests += 1
                 self._last_actions = list(actions)
                 self._last_latency = latency
@@ -407,6 +441,12 @@ class StreamVlnPolicyNode(Node):
                     f"speed cap bound (v={plan.v_cmd:.2f} m/s, w={math.degrees(plan.w_cmd):.1f} deg/s)"
                     " -- chunk under-travels vs the trained increments")
             self._append_plan(plan)
+
+            if not plan.segments:
+                # Nothing to execute (typically a latched STOP returning [0] instantly).
+                # Without a floor here the loop would re-request at the server's reply
+                # rate and hammer it at ~100 Hz.
+                self._shutdown.wait(0.2)
 
             if self._verbose:
                 self.get_logger().info(
@@ -448,6 +488,8 @@ class StreamVlnPolicyNode(Node):
                 "chunk_seconds": self._chunk_seconds,
                 "requests": self._requests,
                 "resets": self._resets,
+                "stops": self._stops,
+                "stop_behavior": self._stop_behavior,
                 "errors": self._errors,
                 "consec_errors": self._consec_errors,
                 "last_error": self._last_error,

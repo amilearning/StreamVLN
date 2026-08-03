@@ -27,6 +27,9 @@ _OVERRIDES = {
     "execute_tokens": int,
     "joy_gate_enable": lambda s: s.strip().lower() in ("1", "true", "yes", "on"),
     "joy_button": int,
+    "stop_behavior": str,
+    "autostart": lambda v: v.strip().lower() in ("1","true","yes","on"),
+    "default_prompt": str,
 }
 
 _DEFAULT_PARAMS = os.path.join(

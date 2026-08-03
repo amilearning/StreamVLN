@@ -91,6 +91,18 @@ streamvln_policy_node:
     # talk to it at once) every request fails until it is reset, so force a reset after
     # this many consecutive failures rather than retrying into a dead session forever.
     reset_after_errors: 3
+
+    # What happens when the model emits a STOP token:
+    #   latch     halt and wait for a new prompt. The model believes the task is done,
+    #             so this is the honest default.
+    #   continue  reset the session and keep navigating -- use for open-ended roaming,
+    #             or when a prompt has no completion condition.
+    #
+    # NOTE this also clears a latch on the SERVER: http_realworld_server.py sets a global
+    # `terminate` flag on the first STOP and then returns [0] to every later request
+    # WITHOUT running the model (visible as ~0.008 s "inference"). Only a reset clears it,
+    # which is why 'continue' resets rather than merely ignoring the token.
+    stop_behavior: "latch"
     default_prompt: ""             # only used when autostart is true
     autostart: false               # true = start on default_prompt without waiting for /prompt
     verbose: true
