@@ -149,7 +149,7 @@ if __name__ == '__main__':
     config = transformers.AutoConfig.from_pretrained(args.model_path)
     model = StreamVLNForCausalLM.from_pretrained(
                 args.model_path,
-                attn_implementation="flash_attention_2",
+                attn_implementation=os.environ.get("STREAMVLN_ATTN", "sdpa"),  # flash_attention_2 needs a CUDA build; sdpa works everywhere
                 torch_dtype=torch.bfloat16,
                 config=config,
                 low_cpu_mem_usage=False,
