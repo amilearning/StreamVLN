@@ -122,3 +122,141 @@ Server prints the action sequence; robot moves.
 ## What we DON'T need (real-world path)
 habitat-sim, habitat-lab, MP3D/HM3D scenes, VLN-CE R2R/RxR/EnvDrop/ScaleVLN episodes,
 trajectory data, co-training datasets — all benchmark/training only.
+
+---
+
+# ✅ WORKING RECIPE #2 — Jetson Thor (Docker), verified 2026-08-03
+
+Second, independent deployment: the model runs **onboard the Thor**, no 4090 in the loop.
+This answers open decision #1 — either host works; Thor measured **~1.2 s/request**, close
+enough to the 4090 that offboarding is optional rather than required.
+
+**Ignore the README env entirely on Thor.** Python 3.9 / torch 2.1.2 / CUDA 12.4 cannot
+exist on this board — Thor is Blackwell `sm_110`, CUDA 13.0, Ubuntu 24.04, Python 3.12,
+L4T R38.4 (JetPack 7). There is no conda channel with a Thor-capable torch. Docker, not conda.
+
+## Approach: layer on an existing image
+`policy-server:thor` already carries the hard part — NVIDIA-built
+`torch 2.9.0a0+nv25.09` (CUDA 13.0, `sm_110`), `flash_attn 2.7.4.post1`, timm, av, numpy.
+Build `streamvln:thor` **FROM** it; the base image is not modified.
+
+Tracing the real import graph of `http_realworld_server.py` → `streamvln_agent.py` →
+`stream_video_vln.py` collapses `requirements.txt`'s 155 pins down to four actions:
+
+| Need | Action |
+|---|---|
+| `transformers==4.45.1` | **downgrade** from the base image's 5.14.1 (+ `tokenizers<0.21`, `huggingface_hub<1.0`) |
+| `flask` | **install** — missing from `requirements.txt` |
+| `quaternion`, `depth_camera_filtering` | **stub** — imported at module scope, never called |
+| torch / torchvision / flash_attn / timm / av / numpy / PIL / einops | already present ✓ |
+| habitat, decord, deepspeed, torch-scatter, clip, bitsandbytes | **skip** — benchmark/training only, or guarded by `try/except` |
+
+## ⚠️ The transformers pin is the whole ballgame
+StreamVLN's vendored LLaVA targets the 4.45-era API. On transformers 5.x it breaks
+**silently — no exception, just wrong behavior**:
+- `model/stream_video_vln.py:418` overrides `prepare_inputs_for_generation(..., num_logits_to_keep=...)`.
+  That kwarg was renamed `logits_to_keep` after 4.46, so on 5.x the override stops matching.
+- `streamvln_agent.py:252` hand-carries `past_key_values` as a legacy tuple across steps;
+  5.x is `Cache`-only. (On 4.45 the server logs the matching
+  *"From v4.47 onwards ... will return a Cache instance"* deprecation notice — that legacy
+  tuple is exactly what the agent depends on.)
+- `llava/model/language_model/modeling_llama.py:32,44` imports `LlamaFlashAttention2` and
+  `is_flash_attn_greater_or_equal_2_10`, both removed in 5.x. This one is survivable —
+  `llava/model/__init__.py` wraps sub-model imports in `try/except` and only prints.
+
+Install with `--no-deps` so pip can never touch the NVIDIA torch build, which is
+unreplaceable (no upstream wheel targets `sm_110`).
+
+## ⚠️ The SigLIP vision tower is NOT in the checkpoint
+`config.json` sets `mm_vision_tower = google/siglip-so400m-patch14-384` and fetches it by
+repo id at load time. It must be pre-staged into an HF cache or the server cannot start
+offline — which is what you want on a robot anyway.
+
+## Dockerfile (`~/streamvln_thor/Dockerfile`)
+```dockerfile
+FROM policy-server:thor
+
+# --no-deps protects torch/numpy (unreplaceable Jetson builds). transformers' remaining
+# runtime deps are already present from the base image's 5.x install.
+# --ignore-installed blinker: base image's blinker is a Debian package with no RECORD
+# file, so pip cannot uninstall it when Flask pulls a newer one.
+RUN pip install --no-cache-dir --no-deps "transformers==4.45.1" \
+ && pip install --no-cache-dir --ignore-installed blinker \
+      "tokenizers==0.20.3" "huggingface_hub<1.0" flask
+
+# Imported at module scope but never called; both fight aarch64/numpy-1.x builds.
+RUN printf 'def filter_depth(*a, **k):\n    raise NotImplementedError("unused on the real-world path")\n' \
+      > /usr/local/lib/python3.12/dist-packages/depth_camera_filtering.py \
+ && printf 'def __getattr__(name):\n    raise AttributeError(name)\n' \
+      > /usr/local/lib/python3.12/dist-packages/quaternion.py
+
+# http_realworld_server.py:28 does ImageFont.truetype("DejaVuSansMono.ttf") on EVERY
+# request. The font ships only inside matplotlib's private data dir, where PIL will not
+# look — so publish it on the system font path rather than patching the server.
+RUN mkdir -p /usr/share/fonts/truetype/dejavu \
+ && cp /usr/local/lib/python3.12/dist-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSansMono.ttf \
+       /usr/share/fonts/truetype/dejavu/ \
+ && python3 -c "from PIL import ImageFont; ImageFont.truetype('DejaVuSansMono.ttf', 20); print('font OK')"
+
+RUN python3 -c "import torch, transformers, flask, quaternion, depth_camera_filtering as d; \
+assert transformers.__version__ == '4.45.1', transformers.__version__; \
+print('OK torch', torch.__version__, '| transformers', transformers.__version__)"
+
+ENV STREAMVLN_ATTN=sdpa \
+    PYTHONPATH=/workspace/StreamVLN:/workspace/StreamVLN/streamvln \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    HF_HUB_OFFLINE=1
+WORKDIR /workspace/StreamVLN/streamvln
+```
+Note: nothing CUDA-dependent can be asserted at build time — no GPU is visible during
+`docker build` (`get_device_capability()` and even `get_arch_list()` both fail). Check
+those at runtime instead.
+
+## Fetch the two model artifacts
+```bash
+mkdir -p ~/streamvln_ckpt/hf_cache
+# 1) policy checkpoint (~15 GB)
+docker run --rm --network host --user $(id -u):$(id -g) \
+  -e HF_HOME=/ckpt/.hfcache -e HOME=/ckpt -v ~/streamvln_ckpt:/ckpt streamvln:thor \
+  hf download mengwei0427/StreamVLN_Video_qwen_1_5_r2r_rxr_envdrop_scalevln_real_world \
+    --local-dir /ckpt/streamvln_real_world
+# 2) SigLIP vision tower (~3.3 GB) — required, see above
+docker run --rm --network host --user $(id -u):$(id -g) \
+  -e HF_HOME=/hf -e HF_HUB_OFFLINE=0 -e HOME=/hf -v ~/streamvln_ckpt/hf_cache:/hf \
+  streamvln:thor hf download google/siglip-so400m-patch14-384
+```
+
+## Launch (`~/streamvln_thor/run_server.sh`)
+Code and checkpoint are **mounted, not baked in**, so the server stays editable without a rebuild.
+```bash
+docker run --rm -it --runtime nvidia --network host --ipc=host --name streamvln_server \
+  -e STREAMVLN_ATTN=sdpa -e HF_HOME=/hf \
+  -v ~/StreamVLN:/workspace/StreamVLN \
+  -v ~/streamvln_ckpt/streamvln_real_world:/ckpt:ro \
+  -v ~/streamvln_ckpt/hf_cache:/hf:ro \
+  streamvln:thor \
+  python3 http_realworld_server.py --model_path /ckpt --device cuda:0
+```
+
+## Measured on Thor
+```
+POST http://127.0.0.1:5801/eval_vln
+  req 0:  1.24s  action=[3, 3, 1, 3]  >>^>
+  req 1:  1.17s  action=[3, 3, 3, 1]  >>>^
+  req 2:  1.15s  action=[3, 3, 3, 3]  >>>>
+```
+~1.2 s/request (each request = 4 `evaluator.step` calls, 1 model `generate`).
+Memory is a non-issue: **33 GB of 122 GB unified** — `nvidia-smi` reports `N/A` for
+memory on Thor, so read `free -g` instead. `flash_attn` 2.7.4.post1 is present and
+sm_110-capable, so `STREAMVLN_ATTN=flash_attention_2` is worth trying for extra speed
+once `sdpa` is confirmed working.
+
+## Still TODO before driving a robot
+1. **The instruction is hardcoded** (`http_realworld_server.py:74`) and the client sends
+   only `{"reset": bool}` — no instruction field exists. The smoke-test actions above are
+   therefore meaningless; they prove the pipeline runs, not that it understands anything.
+   Plumbing the instruction through the POST body is the first real change needed.
+2. `go2_vln_client.py` **will not import** — it calls `ReadWriteLock()` at line 31 but only
+   does `from pid_controller import *`, which does not export it. Add `from utils import ReadWriteLock`.
+3. The server writes `runs<MMDD-HHMM>/rgb_N_annotated.png` into the CWD, i.e. straight into
+   the mounted git working tree. Redirect it or gitignore it.
